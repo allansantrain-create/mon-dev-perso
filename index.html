@@ -295,6 +295,7 @@
   <button class="nb" data-page="goals" onclick="sp('goals')"><span class="nb-icon">🎯</span><span class="nb-label">Objectifs</span></button>
   <button class="nb" data-page="finance" onclick="sp('finance')"><span class="nb-icon">💰</span><span class="nb-label">Finance</span></button>
   <div style="flex:1"></div>
+  <button class="nb" id="sync-nb" onclick="openSync()" title="Synchronisation"><span class="nb-icon">🔄</span><span class="nb-label">Synchro</span></button>
   <button class="nb" onclick="showReset()" title="Réinitialiser"><span class="nb-icon">⚙️</span><span class="nb-label">Reset</span></button>
 </nav>
 
@@ -697,6 +698,21 @@
     </div>
   </div>
 
+  <!-- Modal Synchronisation -->
+  <div class="mo" id="sync-modal">
+    <div class="md" style="max-width:380px">
+      <div class="mt">🔄 Synchronisation Google Drive</div>
+      <p style="font-size:13px;color:var(--muted);margin-bottom:14px;line-height:1.6">Tes données sont copiées dans ton Google Drive : elles sont identiques sur tous tes appareils et lisibles par ton tableau de bord du matin. À configurer une fois par appareil.</p>
+      <input class="mi" id="sync-url" placeholder="URL du script (https://script.google.com/macros/s/…/exec)" autocomplete="off"/>
+      <input class="mi" id="sync-token" placeholder="Code secret" autocomplete="off"/>
+      <div id="sync-status" style="font-size:12px;color:var(--muted);margin-bottom:16px;min-height:18px"></div>
+      <div class="mac">
+        <button class="bcnl" onclick="disableSync()">Désactiver</button>
+        <button class="save-btn" onclick="saveSyncConfig()">Enregistrer et synchroniser</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Modal Ajout Dépense -->
   <div class="mo" id="fin-expense-modal">
     <div class="md">
@@ -796,9 +812,12 @@ if(!ST.finance)ST.finance={assets:[],history:[],expenses:[]};
 if(!ST.finance.assets)ST.finance.assets=[];
 if(!ST.finance.history)ST.finance.history=[];
 if(!ST.finance.expenses)ST.finance.expenses=[];
+function toggleTask(t){t.dk=!t.dk;t.dd=t.dk?dateKey(new Date()):null;}
 function sv(){
+  ST._u=Date.now();
   try{
     localStorage.setItem('mpd2',JSON.stringify(ST));
+    if(typeof syncSchedulePush==='function')syncSchedulePush();
   }catch(e){
     console.error('Erreur de sauvegarde:', e);
     showSaveError();
@@ -1055,7 +1074,7 @@ function renderDash(){
   ST.tasks.p.forEach(t=>{
     const d=document.createElement('div');
     d.className='tp'+(t.dk?' dk':'');
-    d.onclick=()=>{t.dk=!t.dk;sv();render()};
+    d.onclick=()=>{toggleTask(t);sv();render()};
     d.innerHTML=`<div class="tpc">${t.dk?'✓':''}</div><div><div class="tpt" style="font-size:13px">${t.text}</div><span class="dtag ${t.d==='pro'?'dpro':'dperso'}">${t.d==='pro'?'💼 Pro':'🏠 Perso'}</span></div>`;
     dtl.appendChild(d);
   });
@@ -1597,7 +1616,7 @@ function renderTasks(){
       d.className='ti'+(t.dk?' dk':'')+(pi===0?' pri':'');
       const calBtn=pi===0?`<button class="task-cal-btn" onclick="addTaskToCalendar(${t.id},event)" title="Ajouter à l'agenda">📅</button>`:'';
       d.innerHTML=`<div class="tic">${t.dk?'✓':''}</div><div style="flex:1"><div class="tit" style="font-size:14px">${t.text}</div><span class="dtag ${t.d==='pro'?'dpro':'dperso'}">${t.d==='pro'?'💼 Pro':'🏠 Perso'}</span></div>${calBtn}`;
-      d.querySelector('.tic').onclick=(e)=>{e.stopPropagation();t.dk=!t.dk;sv();render()};
+      d.querySelector('.tic').onclick=(e)=>{e.stopPropagation();toggleTask(t);sv();render()};
       el.appendChild(d);
     });
   });
@@ -1645,7 +1664,7 @@ function addTask(isPri){
   const inp=document.getElementById(ii);const tx=inp.value.trim();
   if(!tx)return;
   if(isPri&&ST.tasks.p.filter(t=>!t.dk).length>=3){alert('Maximum 3 priorités actives !');return;}
-  const t={id:ST.nid++,text:tx,d:document.getElementById(di).value,dk:false};
+  const t={id:ST.nid++,text:tx,d:document.getElementById(di).value,dk:false,c:TK};
   if(isPri)ST.tasks.p.push(t);else ST.tasks.e.push(t);
   inp.value='';sv();render();
 }
@@ -2438,7 +2457,7 @@ function showReset() {
 }
 
 function doReset() {
-  try { localStorage.removeItem('mpd2'); } catch(e) {}
+  try { localStorage.removeItem('mpd2'); localStorage.setItem('mpd2_reset','1'); } catch(e) {}
   // Reload page to start fresh
   window.location.reload();
 }
@@ -2448,6 +2467,78 @@ function render(){
 }
 
 renderQuoteTicker();render();renderHabits();drawProgChart();
+
+// ───────── SYNCHRONISATION GOOGLE DRIVE ─────────
+// Config stockée sur l'appareil uniquement (jamais dans le code publié).
+function syncCfg(){try{return JSON.parse(localStorage.getItem('mpd2_sync')||'null')}catch(e){return null}}
+let __syncTimer=null,__syncPending=false;
+function syncStatus(msg,ok){
+  const el=document.getElementById('sync-status');if(el){el.textContent=msg;el.style.color=ok===false?'var(--acc3)':ok?'var(--acc)':'var(--muted)';}
+  const nb=document.getElementById('sync-nb');if(nb)nb.title='Synchronisation — '+msg;
+}
+function syncHasData(st){return !!st&&((st.tasks&&(st.tasks.p.length||st.tasks.e.length))||(st.habitLog&&Object.keys(st.habitLog).length)||(st.finance&&st.finance.assets&&st.finance.assets.length));}
+async function syncGet(cfg){
+  const r=await fetch(cfg.url+'?token='+encodeURIComponent(cfg.token),{cache:'no-store'});
+  const j=await r.json();if(j.error)throw new Error(j.error);return j; // {updatedAt, state}
+}
+async function syncPush(){
+  const cfg=syncCfg();if(!cfg)return;
+  __syncPending=true;
+  try{
+    const r=await fetch(cfg.url,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},
+      body:JSON.stringify({token:cfg.token,updatedAt:ST._u||Date.now(),device:navigator.userAgent.slice(0,80),state:ST})});
+    const j=await r.json();
+    if(j.error)throw new Error(j.error);
+    if(j.stale){await syncPull(true);return;}
+    __syncPending=false;syncStatus('Synchronisé à '+new Date().toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'}),true);
+  }catch(e){syncStatus('Hors ligne — envoi en attente ('+e.message+')',false);}
+}
+function syncSchedulePush(){if(!syncCfg())return;clearTimeout(__syncTimer);__syncTimer=setTimeout(syncPush,1500);}
+function applyRemote(remote){
+  ST={...ST,...remote.state};ST._u=remote.updatedAt;
+  try{localStorage.setItem('mpd2',JSON.stringify(ST))}catch(e){}
+  render();try{drawProgChart()}catch(e){}
+}
+async function syncPull(force){
+  const cfg=syncCfg();if(!cfg)return;
+  try{
+    const remote=await syncGet(cfg);
+    if(remote.state&&(force||(remote.updatedAt||0)>(ST._u||0))){applyRemote(remote);syncStatus('Données mises à jour depuis le cloud',true);}
+    else if(!remote.state||(ST._u||0)>(remote.updatedAt||0)){await syncPush();}
+    else syncStatus('Synchronisé',true);
+  }catch(e){syncStatus('Synchro impossible : '+e.message,false);}
+}
+function openSync(){
+  const c=syncCfg()||{};
+  document.getElementById('sync-url').value=c.url||'';
+  document.getElementById('sync-token').value=c.token||'';
+  syncStatus(c.url?'Configurée sur cet appareil':'Pas encore configurée sur cet appareil');
+  document.getElementById('sync-modal').classList.add('show');
+}
+function disableSync(){localStorage.removeItem('mpd2_sync');syncStatus('Synchro désactivée sur cet appareil');}
+async function saveSyncConfig(){
+  const url=document.getElementById('sync-url').value.trim(),token=document.getElementById('sync-token').value.trim();
+  if(!/^https:\/\/script\.google\.com\/macros\/s\/.+\/exec$/.test(url)){syncStatus("L'URL doit finir par /exec",false);return;}
+  if(!token){syncStatus('Code secret manquant',false);return;}
+  const cfg={url,token};syncStatus('Connexion…');
+  let remote;
+  try{remote=await syncGet(cfg);}catch(e){syncStatus('Échec : '+(e.message==='unauthorized'?'code secret incorrect':e.message),false);return;}
+  localStorage.setItem('mpd2_sync',JSON.stringify(cfg));
+  // Premier branchement : si le cloud ET cet appareil ont des données, on demande lesquelles garder.
+  if(remote.state&&syncHasData(remote.state)&&syncHasData(ST)){
+    const keepCloud=confirm('Le cloud contient déjà des données.\n\nOK = remplacer les données de CET appareil par celles du cloud (une copie de secours est gardée sur l\'appareil).\nAnnuler = envoyer les données de cet appareil vers le cloud.');
+    if(keepCloud){try{localStorage.setItem('mpd2_backup_'+dateKey(new Date()),JSON.stringify(ST))}catch(e){}applyRemote(remote);syncStatus('Données du cloud chargées',true);}
+    else{ST._u=Date.now();try{localStorage.setItem('mpd2',JSON.stringify(ST))}catch(e){}await syncPush();}
+  }else if(remote.state&&syncHasData(remote.state)){applyRemote(remote);syncStatus('Données du cloud chargées',true);}
+  else{ST._u=ST._u||Date.now();await syncPush();}
+}
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')syncPull();});
+window.addEventListener('online',()=>{if(__syncPending)syncPush();});
+(function syncInit(){
+  if(!syncCfg())return;
+  if(localStorage.getItem('mpd2_reset')){localStorage.removeItem('mpd2_reset');sv();return;}
+  syncPull();
+})();
 </script>
 </body>
 </html>
